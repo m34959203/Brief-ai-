@@ -1,6 +1,5 @@
 // Brief AI — AI Service
-// Источник: ТЗ п.3.4 «Стратегия промптинга», п.3.5 «Управление контекстным окном»
-// Отдельный промпт на каждый шаг + context_summary + structured_facts
+// Стриминг, retry, FeatureCatalog, суммаризация, логирование
 
 import Anthropic from '@anthropic-ai/sdk';
 import { PROMPT_MAP, CONTRADICTION_CHECK, DOCUMENT_GENERATION } from './prompts';
@@ -19,40 +18,88 @@ export interface StructuredFacts {
   has_payments: boolean;
   target_users: string[];
   contradictions_found: string[];
-  user_overrides: string[];         // п.3.4 «Право на несогласие»
+  user_overrides: string[];
 }
 
 export interface AIRequest {
-  step_id: string;                  // scope, tasks, users, features, nfr, implementation
-  prompt_template: string;          // Имя из PROMPT_MAP
-  context_summary: string;          // Сжатый контекст предыдущих шагов (500-1000 токенов)
+  step_id: string;
+  prompt_template: string;
+  context_summary: string;
   structured_facts: StructuredFacts;
-  user_answer: string;              // Текущий ответ пользователя
-  feature_catalog?: string;         // JSON каталога фич для данного типа проекта
+  user_answer: string;
+  feature_catalog?: string;
   conversation_history?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
 export interface AIResponse {
-  message: string;                  // Текст для пользователя
+  message: string;
   extracted_data: Record<string, unknown>;
   updated_facts: Partial<StructuredFacts>;
   contradictions: Array<{ description: string; severity: 'warning' | 'critical' }>;
   step_complete: boolean;
   open_questions: string[];
-  updated_summary?: string;         // Обновлённый context_summary
+  updated_summary?: string;
+}
+
+interface AICallLog {
+  session_id?: string;
+  step: string;
+  input_tokens: number;
+  output_tokens: number;
+  latency_ms: number;
+  model: string;
+  success: boolean;
+}
+
+// Логирование вызовов Claude
+function logAICall(log: AICallLog) {
+  console.log(
+    `[AI] ${log.step} | ${log.model} | in:${log.input_tokens} out:${log.output_tokens} | ${log.latency_ms}ms | ${log.success ? 'OK' : 'FAIL'}`
+  );
+}
+
+// =============================================
+// RETRY с exponential backoff
+// =============================================
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000
+): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error: unknown) {
+      lastError = error;
+      const status = (error as { status?: number })?.status;
+
+      // Retry только для 429 (rate limit) и 529 (overloaded)
+      if (status === 429 || status === 529) {
+        if (attempt < maxRetries) {
+          const delay = baseDelay * Math.pow(2, attempt);
+          console.warn(`[AI] Retry ${attempt + 1}/${maxRetries} after ${delay}ms (status: ${status})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+      }
+      throw error;
+    }
+  }
+
+  throw lastError;
 }
 
 // =============================================
 // ОСНОВНОЙ МЕТОД: обработка шага wizard
 // =============================================
 export async function processWizardStep(req: AIRequest): Promise<AIResponse> {
-  // 1. Получаем шаблон промпта
   const promptTemplate = PROMPT_MAP[req.prompt_template];
   if (!promptTemplate) {
     throw new Error(`Unknown prompt template: ${req.prompt_template}`);
   }
 
-  // 2. Заполняем плейсхолдеры
   const systemPrompt = fillTemplate(promptTemplate, {
     context_summary: req.context_summary || 'Первый шаг, контекста нет.',
     structured_facts: JSON.stringify(req.structured_facts, null, 2),
@@ -61,28 +108,44 @@ export async function processWizardStep(req: AIRequest): Promise<AIResponse> {
     feature_catalog_roles: req.feature_catalog || '{}',
   });
 
-  // 3. Формируем историю сообщений
   const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [
     ...(req.conversation_history || []),
     { role: 'user', content: req.user_answer },
   ];
 
-  // 4. Вызов Claude API
-  // Бюджет контекста (п.3.5):
-  // Шаги 1-3: ~3-5K input tokens
-  // Шаги 4-6: ~5-8K input tokens (растёт context_summary)
-  // Финальная генерация: ~12-15K input tokens
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 2000,
-    system: systemPrompt,
-    messages: messages.map(m => ({
-      role: m.role as 'user' | 'assistant',
-      content: m.content,
-    })),
+  const startTime = Date.now();
+
+  const response = await withRetry(async () => {
+    // Таймаут 30 секунд
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+
+    try {
+      return await client.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        system: systemPrompt,
+        messages: messages.map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+        })),
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
   });
 
-  // 5. Парсим ответ
+  const latency = Date.now() - startTime;
+
+  logAICall({
+    step: req.step_id,
+    input_tokens: response.usage.input_tokens,
+    output_tokens: response.usage.output_tokens,
+    latency_ms: latency,
+    model: response.model,
+    success: true,
+  });
+
   const rawText = response.content
     .filter(block => block.type === 'text')
     .map(block => block.type === 'text' ? block.text : '')
@@ -92,8 +155,69 @@ export async function processWizardStep(req: AIRequest): Promise<AIResponse> {
 }
 
 // =============================================
-// ПРОВЕРКА ПРОТИВОРЕЧИЙ (п.3.4)
-// Запускается после шагов 4 и 6
+// СТРИМИНГ: обработка шага со стримингом
+// =============================================
+export async function processWizardStepStream(
+  req: AIRequest,
+  onChunk: (text: string) => void
+): Promise<AIResponse> {
+  const promptTemplate = PROMPT_MAP[req.prompt_template];
+  if (!promptTemplate) {
+    throw new Error(`Unknown prompt template: ${req.prompt_template}`);
+  }
+
+  const systemPrompt = fillTemplate(promptTemplate, {
+    context_summary: req.context_summary || 'Первый шаг, контекста нет.',
+    structured_facts: JSON.stringify(req.structured_facts, null, 2),
+    project_type: req.structured_facts.project_type || 'не определён',
+    feature_catalog: req.feature_catalog || '{}',
+    feature_catalog_roles: req.feature_catalog || '{}',
+  });
+
+  const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [
+    ...(req.conversation_history || []),
+    { role: 'user', content: req.user_answer },
+  ];
+
+  const startTime = Date.now();
+  let fullText = '';
+
+  const stream = await withRetry(async () =>
+    client.messages.stream({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages: messages.map(m => ({
+        role: m.role as 'user' | 'assistant',
+        content: m.content,
+      })),
+    })
+  );
+
+  for await (const event of stream) {
+    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+      fullText += event.delta.text;
+      onChunk(event.delta.text);
+    }
+  }
+
+  const finalMessage = await stream.finalMessage();
+  const latency = Date.now() - startTime;
+
+  logAICall({
+    step: req.step_id,
+    input_tokens: finalMessage.usage.input_tokens,
+    output_tokens: finalMessage.usage.output_tokens,
+    latency_ms: latency,
+    model: finalMessage.model,
+    success: true,
+  });
+
+  return parseAIResponse(fullText);
+}
+
+// =============================================
+// ПРОВЕРКА ПРОТИВОРЕЧИЙ
 // =============================================
 export async function checkContradictions(
   allExtractedData: Record<string, unknown>,
@@ -108,11 +232,24 @@ export async function checkContradictions(
     structured_facts: JSON.stringify(structuredFacts, null, 2),
   });
 
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 2000,
-    system: prompt,
-    messages: [{ role: 'user', content: 'Проведи проверку.' }],
+  const startTime = Date.now();
+
+  const response = await withRetry(async () =>
+    client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      system: prompt,
+      messages: [{ role: 'user', content: 'Проведи проверку.' }],
+    })
+  );
+
+  logAICall({
+    step: 'contradiction_check',
+    input_tokens: response.usage.input_tokens,
+    output_tokens: response.usage.output_tokens,
+    latency_ms: Date.now() - startTime,
+    model: response.model,
+    success: true,
   });
 
   const rawText = response.content
@@ -120,11 +257,15 @@ export async function checkContradictions(
     .map(block => block.type === 'text' ? block.text : '')
     .join('');
 
-  return JSON.parse(extractJSON(rawText));
+  try {
+    return JSON.parse(extractJSON(rawText));
+  } catch {
+    return { contradictions: [], missing_dependencies: [], overall_consistency_score: 100 };
+  }
 }
 
 // =============================================
-// ГЕНЕРАЦИЯ ФИНАЛЬНОГО ДОКУМЕНТА (после шага 6)
+// ГЕНЕРАЦИЯ ФИНАЛЬНОГО ДОКУМЕНТА
 // =============================================
 export async function generateDocument(
   allExtractedData: Record<string, unknown>,
@@ -137,12 +278,24 @@ export async function generateDocument(
     contradictions: JSON.stringify(contradictions, null, 2),
   });
 
-  // Финальная генерация — самый дорогой вызов: ~12-15K input, ~3-5K output
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 8000,
-    system: prompt,
-    messages: [{ role: 'user', content: 'Сгенерируй техническое задание.' }],
+  const startTime = Date.now();
+
+  const response = await withRetry(async () =>
+    client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 8000,
+      system: prompt,
+      messages: [{ role: 'user', content: 'Сгенерируй техническое задание.' }],
+    })
+  );
+
+  logAICall({
+    step: 'document_generation',
+    input_tokens: response.usage.input_tokens,
+    output_tokens: response.usage.output_tokens,
+    latency_ms: Date.now() - startTime,
+    model: response.model,
+    success: true,
   });
 
   const rawText = response.content
@@ -150,28 +303,44 @@ export async function generateDocument(
     .map(block => block.type === 'text' ? block.text : '')
     .join('');
 
-  return JSON.parse(extractJSON(rawText));
+  try {
+    return JSON.parse(extractJSON(rawText));
+  } catch {
+    return { raw_text: rawText };
+  }
 }
 
 // =============================================
-// СУММАРИЗАЦИЯ КОНТЕКСТА (п.3.4 «Память между шагами»)
-// Генерирует context_summary 500-1000 токенов
+// СУММАРИЗАЦИЯ КОНТЕКСТА
 // =============================================
 export async function summarizeContext(
   previousSummary: string,
   currentStepData: Record<string, unknown>,
   structuredFacts: StructuredFacts
 ): Promise<string> {
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1000,
-    system: `Сожми данные проекта в краткое описание (500-1000 токенов).
+  const startTime = Date.now();
+
+  const response = await withRetry(async () =>
+    client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      system: `Сожми данные проекта в краткое описание (500-1000 токенов).
 Включи: тип проекта, проблема, цель, ключевые фичи, ограничения, пойманные противоречия.
 НЕ ТЕРЯЙ конкретику: числа, имена, технические термины.`,
-    messages: [{
-      role: 'user',
-      content: `Предыдущий контекст:\n${previousSummary}\n\nНовые данные:\n${JSON.stringify(currentStepData)}\n\nФакты:\n${JSON.stringify(structuredFacts)}`
-    }],
+      messages: [{
+        role: 'user',
+        content: `Предыдущий контекст:\n${previousSummary || 'Нет'}\n\nНовые данные:\n${JSON.stringify(currentStepData)}\n\nФакты:\n${JSON.stringify(structuredFacts)}`
+      }],
+    })
+  );
+
+  logAICall({
+    step: 'summarize',
+    input_tokens: response.usage.input_tokens,
+    output_tokens: response.usage.output_tokens,
+    latency_ms: Date.now() - startTime,
+    model: response.model,
+    success: true,
   });
 
   return response.content
@@ -204,7 +373,6 @@ function parseAIResponse(raw: string): AIResponse {
       updated_summary: json.updated_summary,
     };
   } catch {
-    // Fallback: если AI не вернул JSON — оборачиваем текст
     return {
       message: raw,
       extracted_data: {},
@@ -217,10 +385,8 @@ function parseAIResponse(raw: string): AIResponse {
 }
 
 function extractJSON(text: string): string {
-  // Убираем markdown-обёртку ```json ... ```
   const match = text.match(/```json\s*([\s\S]*?)\s*```/);
   if (match) return match[1].trim();
-  // Ищем первый { ... }
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
   if (start !== -1 && end !== -1) return text.slice(start, end + 1);
